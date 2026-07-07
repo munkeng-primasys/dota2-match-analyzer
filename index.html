@@ -230,6 +230,27 @@
   .note{color:var(--muted);font-size:12px;margin-top:12px}
   .callout{border:1px dashed var(--baseline);border-radius:10px;padding:14px;color:var(--ink-2);
            text-align:center}
+
+  /* AI coach summary */
+  .coachbtn{padding:8px 16px;border:1px solid var(--baseline);border-radius:8px;
+        background:var(--accent);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+  .coachbtn:hover{filter:brightness(1.08)}
+  .coachbtn:disabled{opacity:.55;cursor:default;filter:none}
+  .coach{color:var(--ink-2);line-height:1.6}
+  .coach p{margin:0 0 10px} .coach p:last-child{margin-bottom:0}
+  .coach b{color:var(--ink)}
+  .aitag{font-size:10px;font-weight:700;letter-spacing:.06em;border-radius:4px;padding:1px 6px;
+        color:#fff;background:var(--accent);vertical-align:2px}
+  .coachnote{color:var(--muted);font-size:11px;margin:10px 0 0}
+  .coachqa{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
+  .askrow{display:flex;gap:8px;flex-wrap:wrap}
+  .askrow input{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--baseline);
+        border-radius:8px;background:var(--page);color:var(--ink);font:inherit}
+  .askrow input:disabled{opacity:.6}
+  .qa{margin:0 0 14px}
+  .qa .q{font-weight:600;color:var(--ink);margin:0 0 4px}
+  .qa .q::before{content:"Q ";color:var(--accent)}
+  .qa .a{margin:0}
 </style>
 </head>
 <body>
@@ -253,6 +274,37 @@
 
   <div id="app"></div>
 </div>
+
+<!-- Firebase: App Check (reCAPTCHA v3) + AI Logic (Gemini Developer API).
+     Runs before dota-analyzer.js and exposes window.geminiModel to it. -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app.js";
+  import { initializeAppCheck, ReCaptchaV3Provider }
+    from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app-check.js";
+  import { getAI, getGenerativeModel, GoogleAIBackend }
+    from "https://www.gstatic.com/firebasejs/12.0.0/firebase-ai.js";
+
+  // Firebase Console → Project settings → General → Your apps → SDK setup and configuration.
+  const app = initializeApp({
+    apiKey: "AIzaSyD8t2YEpmp1pC2hDMnvQIK7r2TdWHSFpzk",
+    authDomain: "dota2-match-analyzer.firebaseapp.com",
+    projectId: "dota2-match-analyzer",
+    storageBucket: "dota2-match-analyzer.firebasestorage.app",
+    messagingSenderId: "480531871116",
+    appId: "1:480531871116:web:912a2d2662c1b9be4812a9",
+  });
+
+  // App Check with reCAPTCHA v3. Site key from google.com/recaptcha/admin.
+  initializeAppCheck(app, {
+    provider: new ReCaptchaV3Provider("6Lc12EgtAAAAACKsFpROEjMfJlv-QswcY2UOelJs"),
+    isTokenAutoRefresh: true,
+  });
+
+  // Gemini Developer API backend.
+  const ai = getAI(app, { backend: new GoogleAIBackend() });
+  window.geminiModel = getGenerativeModel(ai, { model: "gemini-2.5-flash" });
+</script>
+
 <script src="dota-analyzer.js"></script>
 </body>
 </html>

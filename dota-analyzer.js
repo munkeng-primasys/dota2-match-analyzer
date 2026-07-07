@@ -1322,7 +1322,152 @@ function renderDeepDive(state){
 // ---------- page assembly ----------
 
 const state = {m: null, c: null, recs: [], fights: [], sel: null, advMode: 'gold',
-               mode: 'match', player: null, fromPlayer: null};
+               mode: 'match', player: null, fromPlayer: null, coachChat: null};
+
+// ---------- AI coach summary (Firebase AI Logic → Gemini Developer API) ----------
+
+// Build a compact, factual digest of the match. Only data we already computed goes in —
+// prompts that use it tell Gemini not to invent anything beyond it. Shared by the
+// summary and the Q&A chat so both reason over identical facts.
+function matchFacts(state){
+  const {m, c, recs, fights} = state;
+  const side = r => r.isRadiant ? 'Radiant' : 'Dire';
+  const ctx = {m, c, recs, durationMin: (m.duration || 0) / 60,
+               parsed: m.version != null, fights};
+  const strip = s => String(s).replace(/<[^>]+>/g, '');
+  const line = r => {
+    // the app's own diagnostic engine — reuse it so the AI flags the same problems the
+    // deep-dive would, grounded in real evidence rather than guesses
+    const issues = buildInsights(r, ctx)
+      .filter(i => i.sev === 'critical' || i.sev === 'warn')
+      .map(i => `${i.sev === 'critical' ? '!!' : '!'} ${i.title} (${strip(i.ev)})`);
+    return `${side(r)} | ${r.hero.name} (${r.laneName}${r.support ? ', support' : ''}) — ` +
+      `KDA ${r.p.kills}/${r.p.deaths}/${r.p.assists}, ${fmt(r.p.net_worth)} net worth, ` +
+      `${fmt(r.p.gold_per_min)} GPM / ${fmt(r.p.xp_per_min)} XPM, impact ${Math.round(r.impact)}/100` +
+      (r.laneVerdict ? `, lane ${r.laneVerdict}` : '') +
+      (r.fedGoldEst ? `, fed ~${fmt(r.fedGoldEst)} gold on ${r.fedDeaths} deaths` : '') +
+      (issues.length ? `\n    Issues: ${issues.join('; ')}` : `\n    Issues: none flagged`);
+  };
+  const story = buildStory(m, c, recs, fights).join(' ').replace(/<[^>]+>/g, '');
+  return [
+    `Match ${m.match_id} — ${GAME_MODES[m.game_mode] || 'mode ' + m.game_mode}, ${clock(m.duration || 0)}.`,
+    `Result: ${m.radiant_win ? 'Radiant' : 'Dire'} won ${m.radiant_score}-${m.dire_score}.`,
+    `Timeline: ${story}`,
+    ``,
+    `Players (Issues lines are the app's own analysis; !! = critical, ! = warning):`,
+    ...recs.map(line),
+  ].join('\n');
+}
+
+function coachPrompt(state){
+  return [
+    `You are a Dota 2 coach reviewing a finished match. Write a post-game report (~200-260 words).`,
+    ``,
+    `Structure it as:`,
+    `1. One-paragraph verdict: WHY the winning side won.`,
+    `2. "Players to review": go through the players who have flagged Issues below (prioritise !! `,
+    `   critical over ! warnings). For each, name the hero, say in one sentence what went wrong,`,
+    `   and give one concrete fix. Be direct but constructive — this is coaching, not mockery.`,
+    `3. One line naming the single standout (best) player of the match.`,
+    ``,
+    `Rules: base every claim on the data below — the "Issues" lines are the app's own analysis,`,
+    `so treat them as the authoritative list of what to flag. Do not invent stats, items, or events.`,
+    `A player with "Issues: none flagged" played cleanly — do not manufacture problems for them.`,
+    ``,
+    matchFacts(state),
+  ].join('\n');
+}
+
+// Lazily start (and cache) a chat seeded with the match facts, so follow-up questions
+// keep context across turns without re-sending the digest each time.
+function coachChat(state){
+  if (state.coachChat) return state.coachChat;
+  const facts = matchFacts(state);
+  state.coachChat = window.geminiModel.startChat({
+    history: [
+      {role: 'user', parts: [{text:
+        `You are a Dota 2 coach. Here is the data for one finished match. Answer my follow-up ` +
+        `questions about it in plain language. Use ONLY this data — the "Issues" lines are the ` +
+        `app's own analysis. If something isn't in the data, say you can't tell from the match ` +
+        `data rather than guessing. Keep answers focused (a short paragraph unless I ask for more).` +
+        `\n\n${facts}`}]},
+      {role: 'model', parts: [{text:
+        `Got it — I have the full match breakdown. Ask me anything about it.`}]},
+    ],
+  });
+  return state.coachChat;
+}
+
+// Minimal markdown → HTML for Gemini's reply (bold, bullets, paragraphs). Escapes first.
+function mdLite(t){
+  return '<p>' + esc(t.trim())
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/^\s*[-*]\s+(.*)$/gm, '• $1')
+    .replace(/\n{2,}/g, '</p><p>')
+    .replace(/\n/g, '<br>') + '</p>';
+}
+
+async function generateCoachSummary(){
+  const body = $('#coachBody');
+  if (!body) return;
+  if (!window.geminiModel){
+    body.innerHTML = `<p class="coachnote" style="color:var(--critical)">Gemini isn't configured —
+      check the Firebase AI Logic setup in index.html.</p>`;
+    return;
+  }
+  body.innerHTML = `<button class="coachbtn" disabled>Asking Gemini…</button>`;
+  try {
+    const res = await window.geminiModel.generateContent(coachPrompt(state));
+    const text = res.response.text();
+    body.innerHTML = `<div class="coach">${mdLite(text)}</div>
+      <p class="coachnote">Generated by Gemini from this match's data — treat as a second opinion,
+        not gospel. <a href="#" id="coachRegen">Regenerate</a></p>`;
+    const rg = $('#coachRegen');
+    if (rg) rg.addEventListener('click', e => { e.preventDefault(); generateCoachSummary(); });
+  } catch (e){
+    const msg = esc((e && e.message) || String(e));
+    body.innerHTML = `<p class="coachnote" style="color:var(--critical)">Gemini request failed: ${msg}</p>
+      <p class="coachnote">If it mentions App&nbsp;Check, confirm the debug token is registered in the
+        Firebase console. Otherwise check that AI Logic is enabled and the Gemini Developer API is on.</p>
+      <button id="coachRetry" class="coachbtn" style="margin-top:8px">Try again</button>`;
+    const rt = $('#coachRetry');
+    if (rt) rt.addEventListener('click', generateCoachSummary);
+  }
+}
+
+// Follow-up Q&A: send the user's question through the match-seeded chat and append
+// the exchange to the transcript.
+async function askCoach(){
+  const input = $('#coachQ');
+  const log = $('#coachLog');
+  if (!input || !log) return;
+  const q = input.value.trim();
+  if (!q) return;
+  if (!window.geminiModel){
+    log.insertAdjacentHTML('beforeend',
+      `<p class="coachnote" style="color:var(--critical)">Gemini isn't configured — check index.html.</p>`);
+    return;
+  }
+  const ask = $('#coachAsk');
+  input.value = '';
+  input.disabled = ask.disabled = true;
+  log.insertAdjacentHTML('beforeend',
+    `<div class="qa"><p class="q">${esc(q)}</p><div class="a coachnote">Thinking…</div></div>`);
+  const answerEl = log.lastElementChild.querySelector('.a');
+  log.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  try {
+    const res = await coachChat(state).sendMessage(q);
+    answerEl.className = 'a coach';
+    answerEl.innerHTML = mdLite(res.response.text());
+  } catch (e){
+    answerEl.className = 'a coachnote';
+    answerEl.style.color = 'var(--critical)';
+    answerEl.textContent = 'Gemini request failed: ' + ((e && e.message) || String(e));
+  } finally {
+    input.disabled = ask.disabled = false;
+    input.focus();
+  }
+}
 
 function render(){
   const {m, c, recs, fights} = state;
@@ -1346,6 +1491,23 @@ function render(){
         <a href="https://www.opendota.com/matches/${m.match_id}" target="_blank" rel="noopener">OpenDota ↗</a>
       </div>
       <p class="story">${story.join(' ')}</p>
+    </div>
+
+    <div class="card" id="coachCard">
+      <h2>Coach's summary <span class="aitag">AI</span></h2>
+      <p class="h2sub">Gemini reads the scoreboard and each player's flagged issues, then calls out
+        who struggled and what to fix.</p>
+      <div id="coachBody">
+        <button id="coachBtn" class="coachbtn">Generate summary</button>
+      </div>
+      <div class="coachqa">
+        <div id="coachLog"></div>
+        <div class="askrow">
+          <input id="coachQ" placeholder="Ask about this match — e.g. why did Dire lose mid?"
+                 spellcheck="false" autocomplete="off">
+          <button id="coachAsk" class="coachbtn">Ask</button>
+        </div>
+      </div>
     </div>
 
     ${parsed ? '' : `<div class="card"><b>Unparsed match.</b> Lane data, farm curves, fight
@@ -1388,6 +1550,12 @@ function render(){
   // events
   const back = $('#backLink');
   if (back) back.addEventListener('click', e => { e.preventDefault(); renderPlayerMatches(); });
+  const cb = $('#coachBtn');
+  if (cb) cb.addEventListener('click', generateCoachSummary);
+  const ca = $('#coachAsk');
+  if (ca) ca.addEventListener('click', askCoach);
+  const cq = $('#coachQ');
+  if (cq) cq.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); askCoach(); } });
   // both scoreboard rows and impact-ranking rows carry .player + data-slot
   app.querySelectorAll('.player').forEach(row => row.addEventListener('click', () => {
     state.sel = Number(row.dataset.slot);
@@ -1437,6 +1605,7 @@ async function analyze(opts){
     state.recs = buildRecords(m, c);
     state.fights = fightSummaries(m);
     state.fromPlayer = opts.fromPlayer || null;
+    state.coachChat = null;   // new match → fresh AI conversation
     // selection: the player we came from, else the match's standout on the winning team
     let sel = null;
     if (opts.preselectAcc != null){
