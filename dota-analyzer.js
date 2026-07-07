@@ -31,6 +31,15 @@ const kfmt = n => Math.abs(n) >= 1000 ? (n / 1000).toFixed(Math.abs(n) >= 10000 
 const pct = n => n == null ? '—' : Math.round(n * 100) + '%';
 const clock = sec => Math.floor(sec / 60) + ':' + String(Math.floor(sec % 60)).padStart(2, '0');
 
+// A player's name as a link to their OpenDota profile — plain text when anonymous
+// (no account_id). stopPropagation keeps clicks off any select-on-click row it sits in.
+function playerLink(name, account_id){
+  const label = esc(name || 'Anonymous');
+  if (!account_id) return label;
+  return `<a class="pname" href="https://www.opendota.com/players/${account_id}" target="_blank" ` +
+    `rel="noopener" onclick="event.stopPropagation()" title="View ${label} on OpenDota ↗">${label}</a>`;
+}
+
 // ---------- constants (hero / item data), cached in localStorage ----------
 
 let constantsPromise = null;
@@ -957,7 +966,7 @@ function impactRankingHTML(recs, sel){
         <span class="chip ${r.isRadiant ? 'radiant' : 'dire'}" title="${r.isRadiant ? 'Radiant' : 'Dire'}"></span>
         <div class="who">
           <div>${esc(r.hero.name)} ${tag}</div>
-          <div class="p">${esc(p.personaname || 'Anonymous')} · ${esc(r.laneName)}${r.support ? ' · Sup' : ''}
+          <div class="p">${playerLink(p.personaname, p.account_id)} · ${esc(r.laneName)}${r.support ? ' · Sup' : ''}
             · <b style="color:var(--ink-2)">${p.kills}/${p.deaths}/${p.assists}</b></div>
         </div>
       </div>
@@ -1002,7 +1011,7 @@ function teamTable(recs, side, m, c, sel){
       <td><div class="hero">
         ${r.hero.img ? `<img src="${CDN}${esc(r.hero.img)}" alt="" onerror="this.remove()">` : ''}
         <div class="who"><div>${esc(r.hero.name)} <span class="mini">lvl ${p.level ?? '—'}</span></div>
-        <div class="p">${esc(p.personaname || 'Anonymous')}</div></div>
+        <div class="p">${playerLink(p.personaname, p.account_id)}</div></div>
       </div></td>
       <td><span class="pill role">${esc(r.laneName)}${r.support ? ' · Sup' : ''}</span></td>
       <td><b>${p.kills}/${p.deaths}/${p.assists}</b></td>
@@ -1222,7 +1231,7 @@ function renderDeepDive(state){
             <span class="pill role">${esc(r.laneName)} · ${r.support ? 'Support' : 'Core'}</span>
             ${verdictPill}
             <span class="pill ${won ? 'won' : 'lost'}">${won ? 'VICTORY' : 'DEFEAT'}</span></div>
-          <div class="sub2">${esc(r.p.personaname || 'Anonymous')} · level ${r.p.level ?? '—'}
+          <div class="sub2">${playerLink(r.p.personaname, r.p.account_id)} · level ${r.p.level ?? '—'}
             · impact ${r.impact.score}/100 (#${[...recs].sort((a, b) => b.impact.score - a.impact.score)
               .findIndex(x => x === r) + 1} of ${recs.length})</div>
         </div>
@@ -1312,7 +1321,8 @@ function renderDeepDive(state){
 
 // ---------- page assembly ----------
 
-const state = {m: null, c: null, recs: [], fights: [], sel: null, advMode: 'gold'};
+const state = {m: null, c: null, recs: [], fights: [], sel: null, advMode: 'gold',
+               mode: 'match', player: null, fromPlayer: null};
 
 function render(){
   const {m, c, recs, fights} = state;
@@ -1324,6 +1334,8 @@ function render(){
   const hasXp = m.radiant_xp_adv && m.radiant_xp_adv.length;
 
   app.innerHTML = `
+    ${state.fromPlayer ? `<a href="#" class="backlink" id="backLink">←
+      ${esc(state.fromPlayer.name)}'s recent matches</a>` : ''}
     <div class="card">
       <div class="matchhead">
         <span class="big">Match ${m.match_id}</span>
@@ -1373,7 +1385,10 @@ function render(){
   if (hasAdv) renderAdvChart($('#advChart'), m, recs, state.advMode);
   renderDeepDive(state);
 
-  // events — both scoreboard rows and impact-ranking rows carry .player + data-slot
+  // events
+  const back = $('#backLink');
+  if (back) back.addEventListener('click', e => { e.preventDefault(); renderPlayerMatches(); });
+  // both scoreboard rows and impact-ranking rows carry .player + data-slot
   app.querySelectorAll('.player').forEach(row => row.addEventListener('click', () => {
     state.sel = Number(row.dataset.slot);
     app.querySelectorAll('.player').forEach(q =>
@@ -1406,8 +1421,11 @@ function setStatus(msg, isError){
   s.className = isError ? 'error' : '';
 }
 
-async function analyze(){
-  const raw = $('#matchInput').value.trim();
+// opts: {id, preselectAcc, fromPlayer}. Called with no opts from the input box,
+// or with an explicit id when a match is picked from a player's recent-match list.
+async function analyze(opts){
+  opts = opts && opts.id ? opts : {};
+  const raw = opts.id ? String(opts.id) : $('#matchInput').value.trim();
   const idMatch = raw.match(/(\d{6,})/);
   if (!idMatch){ setStatus('Enter a match ID or an OpenDota/Dotabuff match URL.', true); return; }
   const id = idMatch[1];
@@ -1418,12 +1436,21 @@ async function analyze(){
     state.m = m; state.c = c;
     state.recs = buildRecords(m, c);
     state.fights = fightSummaries(m);
-    // default selection: the match's standout player (most kills+assists on the winning team)
-    const winners = state.recs.filter(r => r.isRadiant === !!m.radiant_win);
-    const star = (winners.length ? winners : state.recs)
-      .reduce((w, r) => (r.p.kills * 2 + r.p.assists) > (w.p.kills * 2 + w.p.assists) ? r : w,
-              winners[0] || state.recs[0]);
-    state.sel = star ? star.p.player_slot : null;
+    state.fromPlayer = opts.fromPlayer || null;
+    // selection: the player we came from, else the match's standout on the winning team
+    let sel = null;
+    if (opts.preselectAcc != null){
+      const mine = state.recs.find(r => String(r.p.account_id) === String(opts.preselectAcc));
+      if (mine) sel = mine.p.player_slot;
+    }
+    if (sel == null){
+      const winners = state.recs.filter(r => r.isRadiant === !!m.radiant_win);
+      const star = (winners.length ? winners : state.recs)
+        .reduce((w, r) => (r.p.kills * 2 + r.p.assists) > (w.p.kills * 2 + w.p.assists) ? r : w,
+                winners[0] || state.recs[0]);
+      sel = star ? star.p.player_slot : null;
+    }
+    state.sel = sel;
     render();
     setStatus(fromCache ? 'Loaded from local cache.' : '');
   } catch (e) {
@@ -1431,6 +1458,154 @@ async function analyze(){
   }
 }
 
-$('#goBtn').addEventListener('click', analyze);
-$('#matchInput').addEventListener('keydown', e => { if (e.key === 'Enter') analyze(); });
+// ---------- player lookup ----------
+
+const STEAM64_BASE = 76561197960265728n;
+
+// Turn a name / account id / profile URL into either an id to open or a name to search.
+function resolvePlayerInput(raw){
+  raw = raw.trim();
+  if (!raw) return {kind: 'error', msg: 'Enter a player name, account ID, or profile URL.'};
+  let mm;
+  if ((mm = raw.match(/(?:opendota\.com|dotabuff\.com)\/players\/(\d+)/i)))
+    return {kind: 'id', account_id: mm[1]};
+  if ((mm = raw.match(/steamcommunity\.com\/profiles\/(\d{17})/i)))
+    return {kind: 'id', account_id: (BigInt(mm[1]) - STEAM64_BASE).toString()};
+  if (/steamcommunity\.com\/id\//i.test(raw))
+    return {kind: 'error', msg: 'Steam vanity URLs can’t be resolved here — paste the numeric ' +
+      '/profiles/ URL, an OpenDota/Dotabuff link, or the account ID.'};
+  if (/^\d+$/.test(raw)){
+    if (raw.length >= 17 && raw.startsWith('7656'))
+      return {kind: 'id', account_id: (BigInt(raw) - STEAM64_BASE).toString()};
+    return {kind: 'id', account_id: raw};
+  }
+  return {kind: 'name', q: raw};
+}
+
+async function lookupPlayer(){
+  const res = resolvePlayerInput($('#matchInput').value);
+  if (res.kind === 'error'){ setStatus(res.msg, true); return; }
+  if (res.kind === 'name'){
+    setStatus('Searching for “' + res.q + '”…');
+    try {
+      const hits = await fetch(`${API}/search?q=` + encodeURIComponent(res.q)).then(r => r.json());
+      if (!Array.isArray(hits) || !hits.length){
+        setStatus('No players found for “' + res.q + '”. Their profile may be private.', true);
+        return;
+      }
+      setStatus('');
+      $('#app').innerHTML = playerSearchHTML(hits.slice(0, 12), res.q);
+      $('#app').querySelectorAll('.prow').forEach(row =>
+        row.addEventListener('click', () => openPlayer(row.dataset.acc)));
+    } catch (e) { setStatus('Search failed: ' + e.message, true); }
+    return;
+  }
+  openPlayer(res.account_id);
+}
+
+async function openPlayer(acc){
+  setStatus('Loading player ' + acc + '…');
+  try {
+    const [c, profile, matches] = await Promise.all([
+      getConstants(),
+      fetch(`${API}/players/${acc}`).then(r => r.json()),
+      fetch(`${API}/players/${acc}/recentMatches`).then(r => r.json()),
+    ]);
+    state.c = c;
+    state.player = {account_id: acc, profile: profile || {}, matches: Array.isArray(matches) ? matches : []};
+    setStatus('');
+    renderPlayerMatches();
+  } catch (e) { setStatus('Failed to load player: ' + e.message, true); }
+}
+
+function playerSearchHTML(hits, q){
+  return `<div class="card">
+    <h2>Players matching “${esc(q)}”</h2>
+    <p class="h2sub">Pick the right account to see their recent matches. Private profiles won't appear.</p>
+    <div class="plist">${hits.map(h => `
+      <div class="prow" data-acc="${h.account_id}">
+        <img src="${esc(h.avatarfull || '')}" alt="" onerror="this.style.visibility='hidden'">
+        <div class="who"><div>${playerLink(h.personaname, h.account_id)}</div>
+          <div class="p">account ${h.account_id}${h.last_match_time
+            ? ' · last match ' + new Date(h.last_match_time).toLocaleDateString() : ''}</div></div>
+      </div>`).join('')}</div>
+  </div>`;
+}
+
+function playerMatchesHTML(pl){
+  const {account_id, profile, matches} = pl;
+  const c = state.c;
+  const prof = profile.profile || {};
+  const name = prof.personaname || ('Player ' + account_id);
+  const wins = matches.filter(x => (x.player_slot < 128) === x.radiant_win).length;
+  const wr = matches.length ? Math.round(wins / matches.length * 100) : 0;
+  const rows = matches.map(x => {
+    const hero = c.heroById[x.hero_id] || {name: '#' + x.hero_id, img: ''};
+    const win = (x.player_slot < 128) === x.radiant_win;
+    return `<tr class="matchrow" data-match="${x.match_id}">
+      <td><div class="hero">
+        ${hero.img ? `<img src="${CDN}${esc(hero.img)}" alt="" onerror="this.remove()">` : ''}
+        <div class="who"><div>${esc(hero.name)}</div>
+          <div class="p">${esc(GAME_MODES[x.game_mode] || 'Mode ' + x.game_mode)}</div></div>
+      </div></td>
+      <td><span class="pill ${win ? 'won' : 'lost'}">${win ? 'WIN' : 'LOSS'}</span></td>
+      <td><b>${x.kills}/${x.deaths}/${x.assists}</b></td>
+      <td>${fmt(x.gold_per_min)}</td>
+      <td>${fmt(x.last_hits)}</td>
+      <td>${Math.round((x.duration || 0) / 60)}m</td>
+      <td>${x.start_time ? new Date(x.start_time * 1000).toLocaleDateString() : '—'}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="card">
+    <div class="pprofile">
+      ${prof.avatarfull ? `<img src="${esc(prof.avatarfull)}" alt="" onerror="this.style.visibility='hidden'">` : ''}
+      <div>
+        <div class="name">${playerLink(name, account_id)}</div>
+        <div class="sub2">account ${account_id} · last ${matches.length} games:
+          <b>${wins}W–${matches.length - wins}L</b> (${wr}% win rate)</div>
+      </div>
+      <a class="odlink" href="https://www.opendota.com/players/${account_id}" target="_blank" rel="noopener">OpenDota ↗</a>
+    </div>
+    ${matches.length ? `
+      <div class="tablewrap"><table>
+        <thead><tr><th>Hero</th><th>Result</th><th>K/D/A</th><th>GPM</th><th>LH</th>
+          <th>Length</th><th>When</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <p class="hint">Click a match to analyze it — ${esc(name.split(' ')[0])} will be pre-selected in the report ↓</p>`
+      : `<div class="callout">No public matches for this account. They likely have
+        <b>Expose Public Match Data</b> turned off in Dota 2 settings, so their history is private.</div>`}
+  </div>`;
+}
+
+function renderPlayerMatches(){
+  const app = $('#app');
+  app.innerHTML = playerMatchesHTML(state.player);
+  const name = (state.player.profile.profile || {}).personaname ||
+               ('Player ' + state.player.account_id);
+  app.querySelectorAll('.matchrow').forEach(row => row.addEventListener('click', () => {
+    analyze({id: row.dataset.match, preselectAcc: state.player.account_id,
+             fromPlayer: {account_id: state.player.account_id, name}});
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  }));
+}
+
+function setMode(mode){
+  state.mode = mode;
+  $('#modeSeg').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  const input = $('#matchInput');
+  input.placeholder = mode === 'player'
+    ? 'Player name, account ID, or profile URL (OpenDota / Dotabuff / Steam)'
+    : 'Match ID or URL, e.g. 8882736552';
+  input.value = '';
+  setStatus('');
+  input.focus();
+}
+
+function go(){ state.mode === 'player' ? lookupPlayer() : analyze(); }
+
+$('#goBtn').addEventListener('click', go);
+$('#matchInput').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+$('#modeSeg').querySelectorAll('button').forEach(b =>
+  b.addEventListener('click', () => setMode(b.dataset.mode)));
 analyze(); // auto-run the prefilled match so the page never starts empty
