@@ -168,32 +168,103 @@ function buildRecords(m, c){
       r.laneVerdict = ratio >= 1.12 ? 'won' : ratio <= 0.88 ? 'lost' : 'even';
     }
   }
-  for (const r of recs) r.impact = impactScore(r);
+  // "who you fed": enemy heroes credited with your deaths (killed_by), how many of
+  // your deaths each took, and what share of that enemy's total kills you personally
+  // were. Gold handed over is estimated by apportioning the killer's kill-gold by
+  // the share of their kills you gave them.
+  for (const r of recs){
+    const kb = r.p.killed_by || {};
+    const list = [];
+    for (const npc in kb){
+      if (!npc.startsWith('npc_dota_hero_')) continue;   // ignore towers / creeps / neutrals
+      const foe = recs.find(o => o.isRadiant !== r.isRadiant && o.hero.npc === npc);
+      if (!foe) continue;
+      const deaths = kb[npc];
+      const theirKills = foe.p.kills || 0;
+      const killGold = (foe.p.gold_reasons && foe.p.gold_reasons['11']) || 0;
+      list.push({
+        foe, deaths,
+        shareOfKills: theirKills ? deaths / theirKills : null,
+        goldEst: theirKills ? Math.round(killGold * deaths / theirKills) : 0,
+      });
+    }
+    list.sort((a, b) => b.goldEst - a.goldEst || b.deaths - a.deaths);
+    r.fedTo = list;
+    r.fedDeaths = list.reduce((a, x) => a + x.deaths, 0);
+    r.fedGoldEst = list.reduce((a, x) => a + x.goldEst, 0);
+  }
+  // team totals feed the role-value term (tower siege for cores, stacks for supports)
+  const teamAgg = {};
+  for (const side of [true, false]){
+    const tm = recs.filter(x => x.isRadiant === side);
+    teamAgg[side] = {
+      tower:  tm.reduce((a, x) => a + (x.p.tower_damage || 0), 0),
+      stacks: tm.reduce((a, x) => a + (x.p.camps_stacked || 0), 0),
+    };
+  }
+  const durMin = (m.duration || 0) / 60;
+  for (const r of recs)
+    r.impact = impactScore(r, {team: teamAgg[r.isRadiant], durationMin: durMin,
+                               won: r.isRadiant === !!m.radiant_win});
   return recs;
 }
 
 // Role-fair impact score (0–100). It leans on OpenDota's per-hero benchmark
 // percentiles so a support isn't punished for low farm — each player is measured
-// against others on the SAME hero — then blends in match-relative contribution
-// (kill participation, fight presence) and survival (share of team deaths).
-function impactScore(r){
+// against others on the SAME hero — then blends in fight contribution, survival,
+// and role value (vision for supports, objectives for cores), and finally folds
+// in the match result so winning counts toward the score.
+function impactScore(r, ctx){
+  ctx = ctx || {};
   const p = r.p;
+  const t = ctx.team || {};
+  const durMin = ctx.durationMin || 0;
   const parts = [];
+  const clamp = v => Math.max(0, Math.min(1, v));
+
+  // Hero benchmarks: mean of per-hero percentiles, skipping categories the hero
+  // structurally doesn't do (raw 0) so an empty stat isn't averaged in as noise.
   const bench = p.benchmarks;
   if (bench){
     const pcts = Object.keys(bench)
-      .map(k => bench[k] && bench[k].pct).filter(v => v != null);
+      .filter(k => bench[k] && bench[k].pct != null && bench[k].raw > 0)
+      .map(k => bench[k].pct);
     if (pcts.length)
-      parts.push({k: 'Hero benchmarks', w: 40, v: pcts.reduce((a, b) => a + b, 0) / pcts.length});
+      parts.push({k: 'Hero benchmarks', w: 35, v: pcts.reduce((a, b) => a + b, 0) / pcts.length});
   }
-  if (r.kp != null) parts.push({k: 'Kill participation', w: 25, v: Math.min(r.kp, 1)});
-  if (p.teamfight_participation != null)
-    parts.push({k: 'Fight presence', w: 15, v: p.teamfight_participation});
-  // survival: ≤10% of team deaths → full marks, ≥35% → zero
-  parts.push({k: 'Survival', w: 20, v: Math.max(0, Math.min(1, 1 - (r.deathShare - 0.10) / 0.25))});
+
+  // Fight contribution: kill participation and teamfight presence folded into one
+  // term rather than double-counting the same "were you in the fights?" signal.
+  const fight = [];
+  if (r.kp != null) fight.push(Math.min(r.kp, 1));
+  if (p.teamfight_participation != null) fight.push(p.teamfight_participation);
+  if (fight.length)
+    parts.push({k: 'Fight contribution', w: 25, v: fight.reduce((a, b) => a + b, 0) / fight.length});
+
+  // Survival: share of team deaths, softened — ≤12% is full marks, ≥42% is zero,
+  // so one death in a low-death game no longer wipes the whole component.
+  parts.push({k: 'Survival', w: 15, v: clamp(1 - (r.deathShare - 0.12) / 0.30)});
+
+  // Role value: what benchmarks miss and what actually wins games in the role.
+  // Supports earn it through vision, dewarding and stacks; cores through the
+  // objective (tower) damage that converts a farm lead into the map.
+  if (r.support){
+    const obs = clamp((p.obs_placed || 0) / Math.max(1, durMin / 3));   // ~1 obs / 3 min = full
+    const sen = clamp((p.sen_placed || 0) / Math.max(1, durMin / 4));   // ~1 sentry / 4 min = full
+    const stacks = t.stacks ? clamp((p.camps_stacked || 0) / (t.stacks * 0.4)) : 0;
+    parts.push({k: 'Vision & utility', w: 25, v: 0.5 * obs + 0.25 * sen + 0.25 * stacks});
+  } else {
+    const towerShare = t.tower ? (p.tower_damage || 0) / t.tower : 0;
+    parts.push({k: 'Objective damage', w: 25, v: clamp(towerShare / 0.35)});  // 35% of team siege = full
+  }
+
   const wsum = parts.reduce((a, b) => a + b.w, 0) || 1;
-  const v = parts.reduce((a, b) => a + b.w * b.v, 0) / wsum;
-  return {score: Math.round(v * 100), parts};
+  let v = parts.reduce((a, b) => a + b.w * b.v, 0) / wsum;
+  // Winning is the achievement: fold the result in at 10%, so an even game breaks
+  // toward the winner and no performance scores 100 from the losing side — yet a
+  // clearly stronger individual game on a loss still outranks a weak win.
+  v = 0.9 * v + 0.1 * (ctx.won ? 1 : 0);
+  return {score: Math.round(v * 100), parts, won: !!ctx.won};
 }
 
 // per-teamfight summary; tf.players is aligned with m.players order
@@ -306,6 +377,27 @@ function buildInsights(r, ctx){
       `Farm *toward* where the next fight will happen, not away from it. Keep a TP scroll at all ` +
       `times and react to pings within 2–3 seconds. If you decide to skip a fight, make it a ` +
       `real decision (“I take two towers while they fight”), not an accident of camera position.`));
+  }
+
+  // feeding one specific hero — the single worst version of dying a lot.
+  // key on the most-DEATHS hero (concentration), independent of the gold-sorted display.
+  const fed = r.fedTo && r.fedTo.length
+    ? r.fedTo.reduce((w, x) => x.deaths > w.deaths ? x : w)
+    : null;
+  if (fed && fed.deaths >= 4 && fed.shareOfKills != null && fed.shareOfKills >= 0.35){
+    const heavy = fed.deaths >= 5 && fed.shareOfKills >= 0.5;
+    out.push(insight(heavy ? 'critical' : 'warn', 'You kept feeding one hero',
+      `Died to ${esc(fed.foe.hero.name)} ${fed.deaths}× — that's ${pct(fed.shareOfKills)} of their ` +
+      `${fed.foe.p.kills} kills, and roughly ${fmt(fed.goldEst)} gold handed to a single enemy.`,
+      `Feeding one hero is far worse than spreading deaths around: you're personally funding the ` +
+      `enemy's win condition. Every kill you give ${esc(fed.foe.hero.name)} buys the item that kills ` +
+      `you again — a snowball loop where one hero gets unstoppable off your net worth alone. A fed ` +
+      `carry or mid ends games; the scoreboard's kill count hides that it was mostly one matchup.`,
+      `Name the threat and play around it specifically. Learn ${esc(fed.foe.hero.name)}'s power ` +
+      `spikes and key cooldowns, and buy the item that blunts them (BKB, Force Staff, Glimmer, ` +
+      `detection — whatever fits). Don't path alone where they lurk, hold a TP to escape their ` +
+      `initiation, and ask a teammate to babysit or counter-gank. Breaking this one pattern often ` +
+      `swings the whole game.`));
   }
 
   if ((p.deaths || 0) >= 8 && r.deathShare >= 0.32){
@@ -880,8 +972,11 @@ function impactRankingHTML(recs, sel){
       (bottom). Click any player for their full coaching report.</p>
     <div class="rank">${rows}</div>
     <p class="note">Role-adjusted: each player is measured against others on the <b>same hero</b>
-      (OpenDota benchmarks, 40%), plus kill participation (25%), survival / share of team deaths (20%)
-      and fight presence (15%). A guide for where to look — not a verdict on who to blame.</p>
+      (OpenDota benchmarks, 35%), plus fight contribution — kill participation and teamfight
+      presence (25%), survival / share of team deaths (15%), and role value (25%): vision, dewarding
+      and stacks for supports, or objective (tower) damage for cores. The result is then folded 10%
+      toward the match outcome, so no game scores 100 from the losing side. A guide for where to look
+      — not a verdict on who to blame.</p>
   </div>`;
 }
 
@@ -994,6 +1089,38 @@ function laneCompareHTML(r){
   return `<div class="legend"><span><span class="chip accent"></span>You</span>
     <span><span class="chip gray"></span>Lane opponent${r.laneOpp.length > 1 ? 's (avg)' : ''}: ${names}</span></div>
     <div class="pairs">${rows}</div>`;
+}
+
+function feedingHTML(r){
+  if (!r.fedTo || !r.fedTo.length)
+    return `<p class="mini">${r.p.deaths
+      ? 'No enemy hero is credited with your deaths (died to towers / creeps), or the match is unparsed.'
+      : 'You never died — nothing fed. Clean game!'}</p>`;
+  const maxG = Math.max(1, ...r.fedTo.map(x => x.goldEst));
+  const top = r.fedTo[0];
+  const rows = r.fedTo.map(x => {
+    const title = `Died to ${x.foe.hero.name} ${x.deaths}×` +
+      (x.shareOfKills != null ? ` — ${pct(x.shareOfKills)} of their ${x.foe.p.kills} kills` : '');
+    return `<div class="feedrow" title="${esc(title)}">
+      <div class="foe">
+        ${x.foe.hero.img ? `<img src="${CDN}${esc(x.foe.hero.img)}" alt="" onerror="this.remove()">` : ''}
+        <span>${esc(x.foe.hero.name)}</span></div>
+      <div class="bartrack"><i style="width:${Math.max(4, Math.round(x.goldEst / maxG * 100))}%"></i></div>
+      <div class="v"><b>~${fmt(x.goldEst)}g</b> <span class="mini">· ${x.deaths}×${
+        x.shareOfKills != null ? ` · ${pct(x.shareOfKills)}` : ''}</span></div>
+    </div>`;
+  }).join('');
+  const headline = r.fedTo.length === 1
+    ? `All ${r.fedDeaths} of your deaths fed <b>${esc(top.foe.hero.name)}</b>`
+    : `Your most expensive feeding went to <b>${esc(top.foe.hero.name)}</b> ` +
+      `(~${fmt(top.goldEst)} gold from ${top.deaths} death${top.deaths > 1 ? 's' : ''})`;
+  return `<p class="dd-summary" style="margin-top:0">${headline} — in total you handed the enemy
+    roughly <b>${fmt(r.fedGoldEst)} gold</b> across ${r.fedDeaths} deaths.</p>
+    <div class="feed">${rows}</div>
+    <p class="note">Estimated gold each enemy earned from killing you — their kill income split by the
+      share of their kills you gave them. <b>Bar length = gold fed</b>, and the label shows deaths (×)
+      and your share of that hero's kills. Gold, not death count, drives this view: dying twice to a
+      fed carry can feed more than four deaths to a support.</p>`;
 }
 
 function deathsHTML(r, m, fights){
@@ -1121,6 +1248,12 @@ function renderDeepDive(state){
       <h2>Coaching report</h2>
       <p class="h2sub">What to fix first, why it costs you games, and how to practice it.</p>
       ${insightsHTML(insights)}
+    </div>
+
+    <div class="card">
+      <h2>Who you fed <span class="mini">deaths handed to each enemy hero</span></h2>
+      <p class="h2sub">The enemy who last-hit each of your deaths — feeding one hero snowballs it.</p>
+      ${feedingHTML(r)}
     </div>
 
     <div class="card">
